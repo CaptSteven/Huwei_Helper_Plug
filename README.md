@@ -1,6 +1,6 @@
 # 华为人才在线课程助手 (Huawei Talent Helper)
 
-[![License](https://img.shields.io/github/license/你的用户名/huawei-talent-helper)](LICENSE)
+[![License](https://img.shields.io/github/license/Jhaplin/huawei-talent-helper)](LICENSE)
 [![UserScript](https://img.shields.io/badge/tag-UserScript-orange.svg)](https://www.tampermonkey.net/)
 [![Version](https://img.shields.io/badge/version-1.0-blue.svg)]()
 
