@@ -17,8 +17,8 @@
 // @connect      cn-hongkong.dashscope.aliyuncs.com
 // @connect      cn-hongkong.aliyuncs.com
 // @run-at       document-end
-// @updateURL    https://raw.githubusercontent.com/Jhaplin/huawei-talent-helper/main/src/huawei-talent-helper.user.js
-// @downloadURL  https://raw.githubusercontent.com/Jhaplin/huawei-talent-helper/main/src/huawei-talent-helper.user.js
+// @updateURL    https://raw.githubusercontent.com/CaptSteven/Huwei_Helper_Plug/main/src/huawei-talent-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/CaptSteven/Huwei_Helper_Plug/main/src/huawei-talent-helper.user.js
 // ==/UserScript==
 
 (function () {

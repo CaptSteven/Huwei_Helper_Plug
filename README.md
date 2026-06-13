@@ -1,6 +1,6 @@
 # 华为人才在线课程助手 (Huawei Talent Helper)
 
-[![License](https://img.shields.io/github/license/Jhaplin/huawei-talent-helper)](LICENSE)
+[![License](https://img.shields.io/github/license/CaptSteven/Huwei_Helper_Plug)](LICENSE)
 [![UserScript](https://img.shields.io/badge/tag-UserScript-orange.svg)](https://www.tampermonkey.net/)
 [![Version](https://img.shields.io/badge/version-1.1-blue.svg)]()
 
@@ -28,7 +28,7 @@
 ### 安装脚本
 你可以选择以下任意一种方式安装：
 - **方式 A（推荐，支持跟随主分支自动更新）**：
-  点击安装链接：[点击直接安装 (Raw Link)](https://raw.githubusercontent.com/Jhaplin/huawei-talent-helper/main/src/huawei-talent-helper.user.js) *(请将链接替换为你自己的实际地址)*
+  点击安装链接：[点击直接安装 (Raw Link)](https://raw.githubusercontent.com/CaptSteven/Huwei_Helper_Plug/main/src/huawei-talent-helper.user.js)
 - **方式 B**：复制本仓库 `src/huawei-talent-helper.user.js` 中的完整代码，粘贴至 Tampermonkey 的“添加新脚本”编辑器中保存即可。
 
 ## AI 做题配置
