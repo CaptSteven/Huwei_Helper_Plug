@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.5
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.6
 // @namespace    http://tampermonkey.net/
-// @version      1.3.5
+// @version      1.3.6
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -844,7 +844,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.5</span>
+                    <span id="hw-panel-title">华为助手 v1.3.6</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -928,7 +928,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.5';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.6';
                 }
                 updatePanelUI();
             });
@@ -1225,11 +1225,34 @@
 
     // 防挂机弹窗拦截清除
     setInterval(function handlePopups() {
-        const dialogButtons = document.querySelectorAll('.el-dialog__wrapper button, .el-message-box__wrapper button, .dialog-footer button, button[class*="confirm" i]');
-        dialogButtons.forEach(btn => {
-            const text = btn.innerText || btn.textContent;
-            if (text.includes('继续') || text.includes('确定') || text.includes('确认')) btn.click();
-        });
+        const CONFIRM_KEYWORDS = ['继续', '确定', '确认'];
+        const matchConfirm = (btn) => {
+            if (!btn.offsetParent) return false;
+            const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, '');
+            return CONFIRM_KEYWORDS.some(kw => text.includes(kw));
+        };
+
+        // 第一层：常见弹窗容器选择器（Element UI / sxz 各类弹窗）
+        const dialogButtons = document.querySelectorAll(
+            '.el-dialog__wrapper button, .el-message-box__wrapper button, ' +
+            '.dialog-footer button, button[class*="confirm" i], ' +
+            '[class*="dialog" i] button, [class*="modal" i] button, ' +
+            '[class*="popup" i] button, [class*="alert" i] button, ' +
+            '[class*="msgbox" i] button, [class*="tip" i] button'
+        );
+        dialogButtons.forEach(btn => { if (matchConfirm(btn)) btn.click(); });
+
+        // 第二层兜底：遮罩层存在时在全局搜索确认按钮，覆盖任意自定义弹窗类名
+        const hasOverlay = document.querySelector(
+            '[class*="overlay" i]:not([style*="display: none"]), ' +
+            '[class*="backdrop" i]:not([style*="display: none"]), ' +
+            '[class*="mask" i]:not([style*="display: none"])'
+        );
+        if (hasOverlay && hasOverlay.offsetParent) {
+            Array.from(document.querySelectorAll('button')).forEach(btn => {
+                if (matchConfirm(btn)) btn.click();
+            });
+        }
     }, 3000);
 
 })();
