@@ -1,12 +1,21 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.0 
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.1
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  【非视频节点爆破】专治“本章课件”、“随堂测验”导致的无视频挂机卡死问题。引入前置拦截过滤与黑洞逃逸机制。
+// @version      1.1
+// @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 辅助识别随堂题目。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
 // @match        *://*.huawei.com/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @connect      api.deepseek.com
+// @connect      generativelanguage.googleapis.com
+// @connect      dashscope.aliyuncs.com
+// @connect      dashscope-intl.aliyuncs.com
+// @connect      dashscope-us.aliyuncs.com
+// @connect      cn-hongkong.dashscope.aliyuncs.com
+// @connect      cn-hongkong.aliyuncs.com
 // @run-at       document-end
 // @updateURL    https://raw.githubusercontent.com/Jhaplin/huawei-talent-helper/main/src/huawei-talent-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/Jhaplin/huawei-talent-helper/main/src/huawei-talent-helper.user.js
@@ -24,6 +33,479 @@
         minDelay: 2000,
         maxDelay: 4000
     };
+
+    const STORAGE_KEY_AI = 'HW_TALENT_HELPER_AI_CONFIG';
+    const AI_PROVIDERS = {
+        deepseek: {
+            label: 'DeepSeek 官方',
+            type: 'openai',
+            defaultModel: 'deepseek-v4-flash',
+            defaultBaseUrl: 'https://api.deepseek.com'
+        },
+        gemini: {
+            label: 'Gemini 官方',
+            type: 'gemini',
+            defaultModel: 'gemini-3.5-flash',
+            defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta'
+        },
+        qwen: {
+            label: 'Qwen 官方',
+            type: 'openai',
+            defaultModel: 'qwen-plus',
+            defaultBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+        }
+    };
+
+    const DEFAULT_AI_CONFIG = {
+        enabled: false,
+        autoSolve: false,
+        autoSubmit: false,
+        provider: 'deepseek',
+        apiKeys: { deepseek: '', gemini: '', qwen: '' },
+        models: {
+            deepseek: AI_PROVIDERS.deepseek.defaultModel,
+            gemini: AI_PROVIDERS.gemini.defaultModel,
+            qwen: AI_PROVIDERS.qwen.defaultModel
+        },
+        baseUrls: {
+            deepseek: AI_PROVIDERS.deepseek.defaultBaseUrl,
+            gemini: AI_PROVIDERS.gemini.defaultBaseUrl,
+            qwen: AI_PROVIDERS.qwen.defaultBaseUrl
+        }
+    };
+
+    let AI_CONFIG = loadAiConfig();
+    let aiSolveLock = false;
+    let lastAiQuestionSignature = '';
+    let lastAiSolveTime = 0;
+
+    function loadAiConfig() {
+        let saved = null;
+        try {
+            if (typeof GM_getValue === 'function') saved = GM_getValue(STORAGE_KEY_AI, null);
+        } catch (e) {}
+        if (!saved) {
+            try { saved = localStorage.getItem(STORAGE_KEY_AI); } catch (e) {}
+        }
+        try {
+            const parsed = saved ? JSON.parse(saved) : {};
+            return mergeAiConfig(parsed);
+        } catch (e) {
+            return mergeAiConfig({});
+        }
+    }
+
+    function saveAiConfig(nextConfig) {
+        AI_CONFIG = mergeAiConfig(nextConfig);
+        const serialized = JSON.stringify(AI_CONFIG);
+        try {
+            if (typeof GM_setValue === 'function') GM_setValue(STORAGE_KEY_AI, serialized);
+        } catch (e) {}
+        try { localStorage.setItem(STORAGE_KEY_AI, serialized); } catch (e) {}
+        return AI_CONFIG;
+    }
+
+    function mergeAiConfig(config) {
+        return {
+            ...DEFAULT_AI_CONFIG,
+            ...config,
+            apiKeys: { ...DEFAULT_AI_CONFIG.apiKeys, ...(config.apiKeys || {}) },
+            models: { ...DEFAULT_AI_CONFIG.models, ...(config.models || {}) },
+            baseUrls: { ...DEFAULT_AI_CONFIG.baseUrls, ...(config.baseUrls || {}) }
+        };
+    }
+
+    function getActiveAiProvider() {
+        const providerKey = AI_CONFIG.provider || 'deepseek';
+        return AI_PROVIDERS[providerKey] || AI_PROVIDERS.deepseek;
+    }
+
+    function reportAiStatus(message, level = 'info') {
+        const payload = { message, level, at: Date.now() };
+        if (IS_TOP) updateAiStatus(payload);
+        else {
+            try { window.top.postMessage({ type: 'HW_AI_STATUS', data: payload }, '*'); } catch (e) {}
+        }
+        console.log(`[华为助手 AI] ${message}`);
+    }
+
+    function updateAiStatus(payload) {
+        const statusEl = document.getElementById('lbl-ai-status');
+        if (!statusEl || !payload) return;
+        statusEl.innerText = payload.message || '-';
+        const colorMap = { success: '#67c23a', error: '#f56c6c', warn: '#e6a23c', info: '#606266' };
+        statusEl.style.color = colorMap[payload.level] || colorMap.info;
+    }
+
+    function requestAiSolveFromAllFrames() {
+        solveQuestionsWithAi('manual');
+        document.querySelectorAll('iframe').forEach(ifr => {
+            try { ifr.contentWindow.postMessage({ type: 'HW_AI_SOLVE_REQUEST' }, '*'); } catch (e) {}
+        });
+    }
+
+    async function solveQuestionsWithAi(trigger = 'manual') {
+        AI_CONFIG = loadAiConfig();
+        if (!AI_CONFIG.enabled) {
+            reportAiStatus('请先启用 AI 做题并保存配置', 'warn');
+            return;
+        }
+        if (aiSolveLock) return;
+
+        const questions = collectQuestionGroups();
+        if (questions.length === 0) {
+            if (trigger === 'manual') reportAiStatus('没有在当前页面识别到题目', 'warn');
+            return;
+        }
+
+        const signature = buildQuestionSignature(questions);
+        if (trigger === 'auto' && signature === lastAiQuestionSignature && Date.now() - lastAiSolveTime < 120000) return;
+
+        aiSolveLock = true;
+        lastAiQuestionSignature = signature;
+        lastAiSolveTime = Date.now();
+
+        try {
+            reportAiStatus(`识别到 ${questions.length} 道题，正在请求模型...`, 'info');
+            const answer = await askAiForAnswers(questions);
+            const applied = applyAiAnswers(questions, answer);
+            if (applied > 0) {
+                reportAiStatus(`已回填 ${applied} 道题的答案`, 'success');
+                if (AI_CONFIG.autoSubmit) setTimeout(trySubmitAnswer, 800);
+            } else {
+                reportAiStatus('模型返回了结果，但没有匹配到可回填答案', 'warn');
+            }
+        } catch (err) {
+            reportAiStatus(err && err.message ? err.message : 'AI 做题失败', 'error');
+        } finally {
+            aiSolveLock = false;
+        }
+    }
+
+    function collectQuestionGroups() {
+        const inputSelector = 'input[type="radio"], input[type="checkbox"]';
+        const inputs = Array.from(document.querySelectorAll(inputSelector)).filter(isUsableChoiceInput);
+        if (inputs.length === 0) return [];
+
+        const containers = [];
+        inputs.forEach(input => {
+            const container = findQuestionContainer(input);
+            if (container && !containers.includes(container)) containers.push(container);
+        });
+
+        return containers.map((container, index) => buildQuestionFromContainer(container, index)).filter(Boolean);
+    }
+
+    function findQuestionContainer(input) {
+        const preferred = input.closest([
+            '[class*="question" i]',
+            '[class*="subject" i]',
+            '[class*="exam" i]',
+            '[class*="quiz" i]',
+            '[class*="test" i]',
+            '.el-form-item',
+            'li',
+            'section',
+            'article'
+        ].join(','));
+        const preferredCount = preferred ? preferred.querySelectorAll('input[type="radio"], input[type="checkbox"]').length : 0;
+        if (preferred && preferredCount >= 2 && preferredCount <= 12) return preferred;
+
+        let node = input.parentElement;
+        for (let depth = 0; depth < 5 && node; depth++) {
+            const count = node.querySelectorAll('input[type="radio"], input[type="checkbox"]').length;
+            const text = normalizeText(node.innerText);
+            if (count >= 2 && count <= 12 && text.length > 8) return node;
+            node = node.parentElement;
+        }
+        return input.closest('div') || input.parentElement;
+    }
+
+    function buildQuestionFromContainer(container, index) {
+        const inputs = Array.from(container.querySelectorAll('input[type="radio"], input[type="checkbox"]')).filter(isUsableChoiceInput);
+        if (inputs.length === 0) return null;
+
+        const options = inputs.map((input, optionIndex) => {
+            const text = getOptionText(input, container) || `选项 ${optionIndex + 1}`;
+            return { input, text: stripOptionPrefix(text), rawText: text };
+        }).filter(option => option.text.length > 0);
+        if (options.length === 0) return null;
+
+        const questionText = getQuestionText(container, options);
+        if (!questionText || questionText.length < 2) return null;
+
+        return {
+            index,
+            type: inputs.some(input => input.type === 'checkbox') ? 'multiple' : 'single',
+            text: questionText,
+            options
+        };
+    }
+
+    function getQuestionText(container, options) {
+        const optionTexts = options.map(option => option.rawText).filter(Boolean);
+        let text = normalizeText(container.innerText);
+        optionTexts.forEach(optionText => {
+            const escaped = escapeRegExp(normalizeText(optionText));
+            text = text.replace(new RegExp(escaped, 'g'), ' ');
+        });
+        text = normalizeText(text);
+
+        const titleEl = Array.from(container.querySelectorAll([
+            '[class*="title" i]',
+            '[class*="question" i]',
+            '[class*="subject" i]',
+            '.stem',
+            'h1',
+            'h2',
+            'h3',
+            'p'
+        ].join(','))).find(el => {
+            const t = normalizeText(el.innerText);
+            return t.length > 3 && !optionTexts.some(opt => normalizeText(opt) === t);
+        });
+
+        const titleText = titleEl ? normalizeText(titleEl.innerText) : '';
+        return (titleText && titleText.length <= text.length ? titleText : text).slice(0, 800);
+    }
+
+    function getOptionText(input, container) {
+        const id = input.getAttribute('id');
+        const label = id ? container.querySelector(`label[for="${cssEscape(id)}"]`) : null;
+        if (label) return normalizeText(label.innerText);
+
+        const labelParent = input.closest('label');
+        if (labelParent) return normalizeText(labelParent.innerText);
+
+        const optionNode = input.closest([
+            '[class*="option" i]',
+            '[class*="answer" i]',
+            '.el-radio',
+            '.el-checkbox',
+            'li',
+            'tr',
+            'p',
+            'div'
+        ].join(','));
+        if (!optionNode) return '';
+
+        let text = normalizeText(optionNode.innerText);
+        if (!text) {
+            const nextText = input.nextSibling && input.nextSibling.textContent ? input.nextSibling.textContent : '';
+            text = normalizeText(nextText);
+        }
+        return text;
+    }
+
+    function buildQuestionSignature(questions) {
+        return questions.map(q => `${q.type}:${q.text}:${q.options.map(o => o.text).join('|')}`).join('\n---\n');
+    }
+
+    async function askAiForAnswers(questions) {
+        const providerKey = AI_CONFIG.provider || 'deepseek';
+        const provider = getActiveAiProvider();
+        const apiKey = (AI_CONFIG.apiKeys[providerKey] || '').trim();
+        const model = (AI_CONFIG.models[providerKey] || provider.defaultModel).trim();
+        const baseUrl = (AI_CONFIG.baseUrls[providerKey] || provider.defaultBaseUrl).replace(/\/$/, '');
+
+        if (!apiKey) throw new Error(`请先填写 ${provider.label} API Key`);
+        if (!model) throw new Error(`请先填写 ${provider.label} 模型名`);
+
+        const prompt = buildAnswerPrompt(questions);
+        const text = provider.type === 'gemini'
+            ? await callGeminiApi(baseUrl, apiKey, model, prompt)
+            : await callOpenAiCompatibleApi(baseUrl, apiKey, model, prompt);
+        return parseJsonFromModelText(text);
+    }
+
+    function buildAnswerPrompt(questions) {
+        const compact = questions.map(q => ({
+            questionIndex: q.index,
+            type: q.type,
+            question: q.text,
+            options: q.options.map((option, optionIndex) => ({ optionIndex, text: option.text }))
+        }));
+
+        return [
+            '你是在线课程测验答题助手。请根据题干和选项选择最可能正确的答案。',
+            '严格只返回 JSON，不要解释，不要使用 Markdown。',
+            '返回格式：{"answers":[{"questionIndex":0,"optionIndexes":[0],"confidence":0.8}]}',
+            '单选题 optionIndexes 只放一个索引；多选题可以放多个索引。不确定时选择最可能的答案。',
+            JSON.stringify(compact, null, 2)
+        ].join('\n');
+    }
+
+    function callOpenAiCompatibleApi(baseUrl, apiKey, model, prompt) {
+        return gmRequestJson({
+            method: 'POST',
+            url: `${baseUrl}/chat/completions`,
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            },
+            data: JSON.stringify({
+                model,
+                messages: [
+                    { role: 'system', content: '你只输出可解析 JSON。' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.1,
+                stream: false
+            })
+        }).then(json => {
+            const content = json && json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content;
+            if (!content) throw new Error('模型没有返回答案内容');
+            return content;
+        });
+    }
+
+    function callGeminiApi(baseUrl, apiKey, model, prompt) {
+        return gmRequestJson({
+            method: 'POST',
+            url: `${baseUrl}/models/${encodeURIComponent(model)}:generateContent`,
+            headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': apiKey
+            },
+            data: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.1 }
+            })
+        }).then(json => {
+            const parts = json && json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts;
+            const content = Array.isArray(parts) ? parts.map(part => part.text || '').join('') : '';
+            if (!content) throw new Error('Gemini 没有返回答案内容');
+            return content;
+        });
+    }
+
+    function gmRequestJson(options) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('当前油猴环境不支持 GM_xmlhttpRequest，请确认脚本授权已生效'));
+                return;
+            }
+
+            GM_xmlhttpRequest({
+                ...options,
+                timeout: 60000,
+                onload: (response) => {
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error(`API 请求失败：HTTP ${response.status}`));
+                        return;
+                    }
+                    try {
+                        resolve(JSON.parse(response.responseText));
+                    } catch (e) {
+                        reject(new Error('API 返回内容不是合法 JSON'));
+                    }
+                },
+                ontimeout: () => reject(new Error('API 请求超时')),
+                onerror: () => reject(new Error('API 请求失败，请检查网络、Key 或 @connect 权限'))
+            });
+        });
+    }
+
+    function parseJsonFromModelText(text) {
+        const cleaned = String(text || '').replace(/```json|```/gi, '').trim();
+        const start = cleaned.indexOf('{');
+        const end = cleaned.lastIndexOf('}');
+        if (start === -1 || end === -1 || end <= start) throw new Error('模型返回内容中没有 JSON');
+        const json = JSON.parse(cleaned.slice(start, end + 1));
+        if (!json || !Array.isArray(json.answers)) throw new Error('模型 JSON 缺少 answers 数组');
+        return json;
+    }
+
+    function applyAiAnswers(questions, modelAnswer) {
+        let applied = 0;
+        modelAnswer.answers.forEach(answer => {
+            const question = questions.find(q => q.index === Number(answer.questionIndex));
+            if (!question) return;
+            const indexes = Array.isArray(answer.optionIndexes) ? answer.optionIndexes.map(Number) : [];
+            if (indexes.length === 0) return;
+
+            question.options.forEach((option, idx) => {
+                const shouldSelect = indexes.includes(idx);
+                const input = option.input;
+                if (!input || input.disabled) return;
+
+                if (question.type === 'multiple') {
+                    if (input.checked !== shouldSelect) clickAnswerInput(input);
+                } else if (shouldSelect && !input.checked) {
+                    clickAnswerInput(input);
+                }
+            });
+            applied++;
+        });
+        return applied;
+    }
+
+    function clickAnswerInput(input) {
+        const label = input.id ? document.querySelector(`label[for="${cssEscape(input.id)}"]`) : input.closest('label');
+        const target = label || input;
+        target.click();
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function trySubmitAnswer() {
+        const buttonTexts = ['提交', '确定', '确认', '下一题', '下一步', '保存'];
+        const buttons = Array.from(document.querySelectorAll('button, .el-button, [role="button"], input[type="button"], input[type="submit"]')).filter(isVisibleElement);
+        const btn = buttons.find(el => {
+            const text = normalizeText(el.innerText || el.value || el.getAttribute('aria-label') || '');
+            return buttonTexts.some(keyword => text.includes(keyword));
+        });
+        if (btn) {
+            btn.click();
+            reportAiStatus('已尝试自动提交/进入下一题', 'success');
+        }
+    }
+
+    function isVisibleElement(el) {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    }
+
+    function isUsableChoiceInput(input) {
+        if (!input || input.disabled || input.closest('#hw-global-panel')) return false;
+        if (isVisibleElement(input)) return true;
+        const visualOption = input.closest('label, .el-radio, .el-checkbox, [class*="option" i], [class*="answer" i], li');
+        return isVisibleElement(visualOption);
+    }
+
+    function normalizeText(text) {
+        return String(text || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function stripOptionPrefix(text) {
+        return normalizeText(text).replace(/^[A-Ha-h][.、:：\s]+/, '').replace(/^选项\s*\d+[.、:：\s]*/, '');
+    }
+
+    function escapeRegExp(text) {
+        return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function cssEscape(value) {
+        if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
+        return String(value).replace(/["\\]/g, '\\$&');
+    }
+
+    window.addEventListener('message', (event) => {
+        const msg = event.data;
+        if (!msg || typeof msg !== 'object') return;
+
+        if (msg.type === 'HW_AI_SOLVE_REQUEST') solveQuestionsWithAi('manual');
+        if (msg.type === 'HW_AI_CONFIG_CHANGED') AI_CONFIG = loadAiConfig();
+        if (IS_TOP && msg.type === 'HW_AI_STATUS') updateAiStatus(msg.data);
+    });
+
+    setInterval(() => {
+        AI_CONFIG = loadAiConfig();
+        if (!AI_CONFIG.enabled || !AI_CONFIG.autoSolve) return;
+        solveQuestionsWithAi('auto');
+    }, 5000);
 
     // ==========================================
     // 架构 A：顶层窗口（中央大脑状态融合）
@@ -94,7 +576,7 @@
             panelElement.id = 'hw-global-panel';
             panelElement.style.cssText = `
                 position: fixed; top: 120px; right: 40px; z-index: 2147483647; 
-                width: 260px; background: #ffffff; border: 1px solid #dcdfe6; 
+                width: 320px; background: #ffffff; border: 1px solid #dcdfe6;
                 border-radius: 8px; box-shadow: 0 4px 24px rgba(0,0,0,0.18);
                 font-family: system-ui, sans-serif; font-size: 12px; color: #303133; 
                 padding: 12px; box-sizing: border-box; user-select: none;
@@ -103,7 +585,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">🧭 华为助手 v1.0</span>
+                    <span id="hw-panel-title">华为助手 v1.1</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -127,9 +609,38 @@
                             <input type="number" id="num-speed" value="${CONFIG.playbackSpeed}" step="0.5" min="0.5" max="4.0" style="width: 45px; margin-left: 4px; padding: 1px 3px; border: 1px solid #dcdfe6; border-radius: 4px; text-align: center;"> 
                         </div>
                     </div>
+                    <div style="margin-top: 10px; padding-top: 8px; border-top: 1px solid #ebeef5;">
+                        <div style="font-weight: bold; color: #606266; margin-bottom: 6px;">AI 做题</div>
+                        <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 6px; flex-wrap: wrap;">
+                            <label style="cursor: pointer; display: flex; align-items: center;">
+                                <input type="checkbox" id="chk-ai-enabled" ${AI_CONFIG.enabled ? 'checked' : ''} style="margin: 0 4px 0 0;"> 启用
+                            </label>
+                            <label style="cursor: pointer; display: flex; align-items: center;">
+                                <input type="checkbox" id="chk-ai-auto" ${AI_CONFIG.autoSolve ? 'checked' : ''} style="margin: 0 4px 0 0;"> 自动识别
+                            </label>
+                            <label style="cursor: pointer; display: flex; align-items: center;">
+                                <input type="checkbox" id="chk-ai-submit" ${AI_CONFIG.autoSubmit ? 'checked' : ''} style="margin: 0 4px 0 0;"> 自动提交
+                            </label>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 72px 1fr; gap: 5px 6px; align-items: center;">
+                            <span style="color: #606266;">模型源</span>
+                            <select id="sel-ai-provider" style="width: 100%; border: 1px solid #dcdfe6; border-radius: 4px; padding: 2px 4px;">
+                                ${Object.keys(AI_PROVIDERS).map(key => `<option value="${key}" ${AI_CONFIG.provider === key ? 'selected' : ''}>${AI_PROVIDERS[key].label}</option>`).join('')}
+                            </select>
+                            <span style="color: #606266;">模型名</span>
+                            <input type="text" id="txt-ai-model" style="width: 100%; min-width: 0; border: 1px solid #dcdfe6; border-radius: 4px; padding: 2px 4px; box-sizing: border-box;">
+                            <span style="color: #606266;">API Key</span>
+                            <input type="password" id="txt-ai-key" autocomplete="off" placeholder="仅保存在本地" style="width: 100%; min-width: 0; border: 1px solid #dcdfe6; border-radius: 4px; padding: 2px 4px; box-sizing: border-box;">
+                        </div>
+                        <div style="display: flex; gap: 6px; margin-top: 7px;">
+                            <button id="btn-ai-save" type="button" style="flex: 1; border: 1px solid #dcdfe6; border-radius: 4px; background: #f4f4f5; color: #606266; cursor: pointer; padding: 4px 0;">保存</button>
+                            <button id="btn-ai-solve" type="button" style="flex: 1; border: 1px solid #ee0000; border-radius: 4px; background: #ee0000; color: #fff; cursor: pointer; padding: 4px 0;">识别做题</button>
+                        </div>
+                        <div id="lbl-ai-status" style="margin-top: 6px; color: #909399; line-height: 1.4;">${AI_CONFIG.enabled ? 'AI 已启用' : 'AI 未启用'}</div>
+                    </div>
                 </div>
                 <div id="hw-panel-mini" style="display: none; text-align: center; font-weight: bold; padding: 4px 0; color: #67c23a;">
-                    <span id="lbl-mini-status">▶️</span>
+                    <span id="lbl-mini-status">播放中</span>
                 </div>
             `;
 
@@ -140,6 +651,7 @@
                 let val = parseFloat(e.target.value);
                 if (!isNaN(val)) { CONFIG.playbackSpeed = val; broadcastConfig(); }
             });
+            bindAiPanelControls();
 
             panelElement.querySelector('#btn-fold').addEventListener('click', function() {
                 const body = panelElement.querySelector('#hw-panel-body');
@@ -151,13 +663,13 @@
                     mini.style.display = 'block';
                     this.innerText = '[+]';
                     panelElement.style.width = '140px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '🧭 助手';
+                    panelElement.querySelector('#hw-panel-title').innerText = '助手';
                 } else {
                     body.style.display = 'block';
                     mini.style.display = 'none';
                     this.innerText = '[-]';
-                    panelElement.style.width = '260px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '🧭 华为助手 v2.1';
+                    panelElement.style.width = '320px';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.1';
                 }
                 updatePanelUI();
             });
@@ -183,6 +695,48 @@
             })();
 
             updatePanelUI();
+        }
+
+        function bindAiPanelControls() {
+            const providerSelect = panelElement.querySelector('#sel-ai-provider');
+            const modelInput = panelElement.querySelector('#txt-ai-model');
+            const keyInput = panelElement.querySelector('#txt-ai-key');
+            const enabledInput = panelElement.querySelector('#chk-ai-enabled');
+            const autoInput = panelElement.querySelector('#chk-ai-auto');
+            const submitInput = panelElement.querySelector('#chk-ai-submit');
+
+            const fillProviderFields = () => {
+                AI_CONFIG = loadAiConfig();
+                const provider = providerSelect.value;
+                const providerMeta = AI_PROVIDERS[provider] || AI_PROVIDERS.deepseek;
+                modelInput.value = AI_CONFIG.models[provider] || providerMeta.defaultModel;
+                keyInput.value = AI_CONFIG.apiKeys[provider] || '';
+            };
+
+            const persist = () => {
+                const provider = providerSelect.value;
+                AI_CONFIG = saveAiConfig({
+                    ...loadAiConfig(),
+                    enabled: enabledInput.checked,
+                    autoSolve: autoInput.checked,
+                    autoSubmit: submitInput.checked,
+                    provider,
+                    apiKeys: { ...AI_CONFIG.apiKeys, [provider]: keyInput.value.trim() },
+                    models: { ...AI_CONFIG.models, [provider]: modelInput.value.trim() || AI_PROVIDERS[provider].defaultModel }
+                });
+                updateAiStatus({ message: 'AI 配置已保存', level: 'success' });
+                document.querySelectorAll('iframe').forEach(ifr => {
+                    try { ifr.contentWindow.postMessage({ type: 'HW_AI_CONFIG_CHANGED' }, '*'); } catch (e) {}
+                });
+            };
+
+            providerSelect.addEventListener('change', fillProviderFields);
+            panelElement.querySelector('#btn-ai-save').addEventListener('click', persist);
+            panelElement.querySelector('#btn-ai-solve').addEventListener('click', () => {
+                persist();
+                requestAiSolveFromAllFrames();
+            });
+            fillProviderFields();
         }
 
         function startCentralCountdown() {

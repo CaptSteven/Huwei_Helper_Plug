@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/github/license/Jhaplin/huawei-talent-helper)](LICENSE)
 [![UserScript](https://img.shields.io/badge/tag-UserScript-orange.svg)](https://www.tampermonkey.net/)
-[![Version](https://img.shields.io/badge/version-1.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1-blue.svg)]()
 
 一个基于油猴（Tampermonkey）的超轻量级华为人才在线平台网课助手。支持自动连播、倍速调节、跳过"本章课件" 和 "随堂测验"。
 
@@ -15,6 +15,10 @@
 - **智能连播**：视频播放结束后自动随机延迟（2s ~ 4s）并平滑切到下一课时，贴合人类行为模式。
 - **防挂机拦截**：自动捕获并秒级清理平台弹出的「确定」、「继续观看」等防挂机暂停弹窗。
 - **极简控制台**：原生前端注入 UI 面板，支持实时进度查看、随心调节倍速（0.5x - 4.0x）以及自由开关自动连播。
+- **AI 自动做题**：可在面板中配置模型 API，识别页面内单选/多选题并自动回填答案。
+  - 默认支持 **DeepSeek 官方**、**Gemini 官方**、**Qwen 官方**。
+  - 支持手动点击「识别做题」，也支持开启「自动识别」。
+  - 「自动提交」默认关闭，避免误交；确认风险后可自行开启。
 
 ## 🛠️ 安装运行
 
@@ -26,6 +30,29 @@
 - **方式 A（推荐，支持跟随主分支自动更新）**：
   点击安装链接：[点击直接安装 (Raw Link)](https://raw.githubusercontent.com/Jhaplin/huawei-talent-helper/main/src/huawei-talent-helper.user.js) *(请将链接替换为你自己的实际地址)*
 - **方式 B**：复制本仓库 `src/huawei-talent-helper.user.js` 中的完整代码，粘贴至 Tampermonkey 的“添加新脚本”编辑器中保存即可。
+
+## AI 做题配置
+
+脚本面板的「AI 做题」区域包含：
+
+| 配置项 | 说明 |
+| --- | --- |
+| 启用 | 打开后才允许调用模型 API。 |
+| 自动识别 | 每 5 秒扫描当前页面/iframe，发现题目后自动请求模型。 |
+| 自动提交 | 回填答案后尝试点击「提交 / 确定 / 下一题 / 保存」等按钮，默认关闭。 |
+| 模型源 | DeepSeek 官方、Gemini 官方、Qwen 官方三选一。 |
+| 模型名 | 可改成账号可用的模型；默认值见下表。 |
+| API Key | 仅保存在本地浏览器脚本存储中，不会写入仓库。 |
+
+默认模型与接口：
+
+| 模型源 | 默认模型 | 默认接口 |
+| --- | --- | --- |
+| DeepSeek 官方 | `deepseek-v4-flash` | `https://api.deepseek.com/chat/completions` |
+| Gemini 官方 | `gemini-3.5-flash` | `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` |
+| Qwen 官方 | `qwen-plus` | `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions` |
+
+> 更新到 v1.1 后，Tampermonkey 可能会提示新增 `GM_xmlhttpRequest` 和 `@connect` 授权，这是跨域调用模型 API 所必需的。
 
 ## 架构设计简述
 
