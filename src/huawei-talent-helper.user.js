@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.1
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.2
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 辅助识别随堂题目。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -138,10 +138,12 @@
     }
 
     function requestAiSolveFromAllFrames() {
-        solveQuestionsWithAi('manual');
-        document.querySelectorAll('iframe').forEach(ifr => {
+        const frames = Array.from(document.querySelectorAll('iframe'));
+        if (hasQuestionCandidatesInCurrentDocument() || frames.length === 0) solveQuestionsWithAi('manual');
+        frames.forEach(ifr => {
             try { ifr.contentWindow.postMessage({ type: 'HW_AI_SOLVE_REQUEST' }, '*'); } catch (e) {}
         });
+        if (frames.length > 0) updateAiStatus({ message: '已向课程窗口发送识别请求', level: 'info' });
     }
 
     async function solveQuestionsWithAi(trigger = 'manual') {
@@ -154,7 +156,10 @@
 
         const questions = collectQuestionGroups();
         if (questions.length === 0) {
-            if (trigger === 'manual') reportAiStatus('没有在当前页面识别到题目', 'warn');
+            if (trigger === 'manual') {
+                const startTest = document.querySelector('.start-test');
+                reportAiStatus(startTest && isVisibleElement(startTest) ? '请先点击“开始测验”进入题目页' : '没有在当前页面识别到题目', 'warn');
+            }
             return;
         }
 
@@ -183,6 +188,9 @@
     }
 
     function collectQuestionGroups() {
+        const sxzQuestions = collectSxzQuizQuestions();
+        if (sxzQuestions.length > 0) return sxzQuestions;
+
         const inputSelector = 'input[type="radio"], input[type="checkbox"]';
         const inputs = Array.from(document.querySelectorAll(inputSelector)).filter(isUsableChoiceInput);
         if (inputs.length === 0) return [];
@@ -194,6 +202,49 @@
         });
 
         return containers.map((container, index) => buildQuestionFromContainer(container, index)).filter(Boolean);
+    }
+
+    function collectSxzQuizQuestions() {
+        const testContent = document.querySelector('.test-content');
+        if (!testContent) return [];
+
+        const main = testContent.querySelector('.right-main') || testContent;
+        const optionItems = Array.from(main.querySelectorAll('.option-list-item')).filter(isVisibleElement);
+        if (optionItems.length === 0) return [];
+
+        const titleNode = main.querySelector('.subtitle .main-title, .main-title, [class*="question-title" i], [class*="stem" i]');
+        const questionText = normalizeText(titleNode ? titleNode.innerText : '').replace(/^\d+[、.]\s*/, '');
+        if (!questionText) return [];
+
+        const typeNode = testContent.querySelector('.type-name') || testContent.querySelector('.ks-title');
+        const typeText = normalizeText(typeNode ? typeNode.innerText : '');
+        const options = optionItems.map((item, optionIndex) => {
+            const input = item.querySelector('input[type="radio"], input[type="checkbox"]');
+            const clickTarget = item.querySelector('.option-list') || item;
+            const content = item.querySelector('.option-content, .option-content-wrapper, .content') || item;
+            const text = getSxzOptionText(content, item) || `选项 ${optionIndex + 1}`;
+            return {
+                input,
+                clickTarget,
+                text: stripOptionPrefix(text),
+                rawText: text
+            };
+        }).filter(option => option.input && option.text.length > 0);
+
+        if (options.length === 0) return [];
+
+        return [{
+            index: 0,
+            type: typeText.includes('多选') || options.some(option => option.input.type === 'checkbox') ? 'multiple' : 'single',
+            text: questionText.slice(0, 800),
+            options
+        }];
+    }
+
+    function getSxzOptionText(contentNode, item) {
+        const text = normalizeText(contentNode.innerText || contentNode.textContent);
+        if (text) return text;
+        return normalizeText(item.innerText);
     }
 
     function findQuestionContainer(input) {
@@ -272,12 +323,14 @@
     function getOptionText(input, container) {
         const id = input.getAttribute('id');
         const label = id ? container.querySelector(`label[for="${cssEscape(id)}"]`) : null;
-        if (label) return normalizeText(label.innerText);
+        if (label && normalizeText(label.innerText)) return normalizeText(label.innerText);
 
         const labelParent = input.closest('label');
-        if (labelParent) return normalizeText(labelParent.innerText);
+        if (labelParent && normalizeText(labelParent.innerText)) return normalizeText(labelParent.innerText);
 
         const optionNode = input.closest([
+            '.option-list-item',
+            '.option-list',
             '[class*="option" i]',
             '[class*="answer" i]',
             '.el-radio',
@@ -299,6 +352,10 @@
 
     function buildQuestionSignature(questions) {
         return questions.map(q => `${q.type}:${q.text}:${q.options.map(o => o.text).join('|')}`).join('\n---\n');
+    }
+
+    function hasQuestionCandidatesInCurrentDocument() {
+        return !!document.querySelector('.test-content .option-list-item, input[type="radio"], input[type="checkbox"]');
     }
 
     async function askAiForAnswers(questions) {
@@ -430,9 +487,9 @@
                 if (!input || input.disabled) return;
 
                 if (question.type === 'multiple') {
-                    if (input.checked !== shouldSelect) clickAnswerInput(input);
+                    if (input.checked !== shouldSelect) clickAnswerInput(input, option.clickTarget);
                 } else if (shouldSelect && !input.checked) {
-                    clickAnswerInput(input);
+                    clickAnswerInput(input, option.clickTarget);
                 }
             });
             applied++;
@@ -440,16 +497,34 @@
         return applied;
     }
 
-    function clickAnswerInput(input) {
+    function clickAnswerInput(input, clickTarget) {
         const label = input.id ? document.querySelector(`label[for="${cssEscape(input.id)}"]`) : input.closest('label');
-        const target = label || input;
+        const target = clickTarget || label || input;
         target.click();
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
     function trySubmitAnswer() {
-        const buttonTexts = ['提交', '确定', '确认', '下一题', '下一步', '保存'];
+        const sxzNextBtn = Array.from(document.querySelectorAll('.test-content .subject-btn'))
+            .filter(isVisibleElement)
+            .find(el => /下一题|下一步|提交|完成/.test(normalizeText(el.innerText)));
+        if (sxzNextBtn) {
+            sxzNextBtn.click();
+            reportAiStatus('已尝试自动进入下一题/提交', 'success');
+            return;
+        }
+
+        const sxzSubmitBtn = Array.from(document.querySelectorAll('.test-content .submit-btn'))
+            .filter(isVisibleElement)
+            .find(el => /交卷|提交|完成/.test(normalizeText(el.innerText)));
+        if (sxzSubmitBtn) {
+            sxzSubmitBtn.click();
+            reportAiStatus('已尝试自动交卷/提交', 'success');
+            return;
+        }
+
+        const buttonTexts = ['下一题', '下一步', '保存', '提交', '交卷', '确定', '确认'];
         const buttons = Array.from(document.querySelectorAll('button, .el-button, [role="button"], input[type="button"], input[type="submit"]')).filter(isVisibleElement);
         const btn = buttons.find(el => {
             const text = normalizeText(el.innerText || el.value || el.getAttribute('aria-label') || '');
