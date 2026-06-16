@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.8
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.9
 // @namespace    http://tampermonkey.net/
-// @version      1.3.8
+// @version      1.3.9
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -31,8 +31,14 @@
         autoNext: true,
         playbackSpeed: 1.0,
         minDelay: 2000,
-        maxDelay: 4000
+        maxDelay: 4000,
+        autoCourseware: false,   // 「自动刷课件」：开启后对课件/阅读 PPT 节点逐页翻到末页再推进；默认关，关闭时完全不影响原有连播
+        coursewarePageDelay: 900 // 课件每页之间的停留间隔(ms)，给平台记录每页浏览的时间
     };
+
+    // 课件 / 纯阅读类节点关键词（带翻页 PPT、无视频、无题目）。开启「自动刷课件」时翻页刷完，
+    // 关闭时它们仍按 BLACKLIST_KEYWORDS 原逻辑被跳过。测验/考试/作业/练习不在此列。
+    const COURSEWARE_KEYWORDS = ['课件', '文档', '资料', '阅读', '导读', '图文'];
 
     const STORAGE_KEY_AI = 'HW_TALENT_HELPER_AI_CONFIG';
     const AI_PROVIDERS = {
@@ -175,7 +181,7 @@
         try {
             reportAiStatus(`识别到 ${questions.length} 道题，正在请求模型...`, 'info');
             const answer = await askAiForAnswers(questions);
-            const applied = applyAiAnswers(questions, answer);
+            const applied = await applyAiAnswers(questions, answer);
             if (applied > 0) {
                 reportAiStatus(`已回填 ${applied} 道题的答案`, 'success');
                 if (AI_CONFIG.autoSubmit) setTimeout(trySubmitAnswer, 1500);
@@ -227,6 +233,7 @@
             const text = getSxzOptionText(content, item) || `选项 ${optionIndex + 1}`;
             return {
                 input,
+                item,
                 clickTarget,
                 text: stripOptionPrefix(text),
                 rawText: text
@@ -475,59 +482,108 @@
         return json;
     }
 
-    function applyAiAnswers(questions, modelAnswer) {
-        let applied = 0;
+    function delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // 判断某个选项当前是否处于「已选中」态。sxz 测验是 Vue 托管的，点击后 native input.checked
+    // 会延迟到响应式 tick 之后才更新，因此除了读 input.checked，还兜底检查选项容器的选中态 class /
+    // aria-checked，避免「明明点中了却被判定回填失败」。
+    function isChoiceSelected(option) {
+        const input = option && option.input;
+        if (input && input.checked) return true;
+        const nodes = [
+            option && option.item,
+            option && option.clickTarget,
+            input && input.closest('.option-list-item, .el-radio, .el-checkbox')
+        ];
+        return nodes.some(node => {
+            if (!node) return false;
+            if (node.getAttribute && node.getAttribute('aria-checked') === 'true') return true;
+            // 只认明确的「选中态」class，不收裸 active/selected：后者常被 hover/focus/ripple 常驻，
+            // 在 input.checked 仍为 false 时会误判「已选中」，导致单选跳过点击却判成功、多选误点错项。
+            return /(^|[\s_-])(is-checked|is-selected|is-active|checked|chosen)([\s_-]|$)/i.test(node.className || '');
+        });
+    }
+
+    // 对单道题执行一次点选（按目标索引选中、并取消多选题里多余的勾选）。
+    // forceInput=true 时直接点原生 input，用于第一轮 clickTarget 点击没生效后的补点。
+    function selectQuestionOptions(question, validIndexes, forceInput) {
+        question.options.forEach((option, idx) => {
+            const shouldSelect = validIndexes.includes(idx);
+            const input = option.input;
+            if (!input || input.disabled) return;
+            if (question.type === 'multiple') {
+                if (isChoiceSelected(option) !== shouldSelect) clickAnswerInput(input, option.clickTarget, forceInput);
+            } else if (shouldSelect && !isChoiceSelected(option)) {
+                clickAnswerInput(input, option.clickTarget, forceInput);
+            }
+        });
+    }
+
+    async function applyAiAnswers(questions, modelAnswer) {
+        // 先把模型答案归一成有效的作答目标，过滤越界 / 非法索引（避免点击页面上根本不存在的选项号）
+        const targets = [];
         modelAnswer.answers.forEach(answer => {
             const question = questions.find(q => q.index === Number(answer.questionIndex));
             if (!question) return;
             const indexes = Array.isArray(answer.optionIndexes) ? answer.optionIndexes.map(Number) : [];
-            // 过滤越界 / 非法索引，避免模型给出页面上根本不存在的选项号
             const validIndexes = indexes.filter(i => Number.isInteger(i) && i >= 0 && i < question.options.length);
             if (validIndexes.length === 0) {
                 console.log(`[华为助手 AI] 第 ${question.index} 题：模型返回索引 ${JSON.stringify(indexes)} 超出 0~${question.options.length - 1}，跳过回填且不计入已答（避免空答被推进）`);
                 return;
             }
+            targets.push({ question, validIndexes });
+        });
+        if (targets.length === 0) return 0;
 
-            question.options.forEach((option, idx) => {
-                const shouldSelect = validIndexes.includes(idx);
-                const input = option.input;
-                if (!input || input.disabled) return;
+        // 第一轮点选
+        targets.forEach(({ question, validIndexes }) => selectQuestionOptions(question, validIndexes));
 
-                if (question.type === 'multiple') {
-                    if (input.checked !== shouldSelect) clickAnswerInput(input, option.clickTarget);
-                } else if (shouldSelect && !input.checked) {
-                    clickAnswerInput(input, option.clickTarget);
-                }
+        // 等 Vue 响应式更新 / 选项组件就绪后验收；凡是没选中的，直接点原生 input 补一轮。
+        // 这一步专治「测验前几题组件还没挂载好、点击没生效」导致的回填竞态。
+        await delay(400);
+        targets.forEach(({ question, validIndexes }) => {
+            const allOk = validIndexes.every(i => isChoiceSelected(question.options[i]));
+            if (!allOk) selectQuestionOptions(question, validIndexes, true);
+        });
+        await delay(300);
+
+        // 用最终真实选中态统一验收单选 / 多选，只有确实选上才计入已答并允许推进。
+        let applied = 0;
+        targets.forEach(({ question, validIndexes }) => {
+            // 只在「可点选」的目标里验收：selectQuestionOptions 对 disabled 选项直接跳过不点，
+            // 若把禁用目标也算进多选的应选总数，会出现 selectedCount 永远 < 应选数 → 永不推进、每 120s 重试卡死。
+            const selectable = validIndexes.filter(i => {
+                const inp = question.options[i] && question.options[i].input;
+                return inp && !inp.disabled;
             });
-
-            // 单选题：radio 点击后 input.checked 同步更新，用真实状态判断是否作答成功。
-            // 多选题：Vue 托管 checkbox，input.checked 在 nextTick 后才更新；
-            //         只要 validIndexes 非空且选项元素存在，视为点击已发出，交由后续 1.5s 延迟验收。
-            if (question.type === 'multiple') {
-                const allTargetsExist = validIndexes.every(i => question.options[i] && question.options[i].input);
-                if (allTargetsExist) {
-                    applied++;
-                } else {
-                    console.log(`[华为助手 AI] 第 ${question.index} 题（多选）：部分选项元素不存在，跳过推进`);
-                }
+            const selectedCount = selectable.filter(i => isChoiceSelected(question.options[i])).length;
+            const ok = question.type === 'multiple'
+                ? (selectable.length > 0 && selectedCount === selectable.length)
+                : selectedCount > 0;
+            if (ok) {
+                applied++;
             } else {
-                const reallySelected = validIndexes.filter(i => question.options[i] && question.options[i].input && question.options[i].input.checked).length;
-                if (reallySelected > 0) {
-                    applied++;
-                } else {
-                    console.log(`[华为助手 AI] 第 ${question.index} 题：点选后没有任何选项处于选中态，判定回填失败，不推进（留待下一轮重试或人工处理）`);
-                }
+                console.log(`[华为助手 AI] 第 ${question.index} 题：两轮点选后仍未选中（验收失败），不推进（留待下一轮重试或人工处理）`);
             }
         });
         return applied;
     }
 
-    function clickAnswerInput(input, clickTarget) {
+    function clickAnswerInput(input, clickTarget, forceInput) {
+        // 只点一次：多选 checkbox 双击会相互抵消。第一轮点可视 clickTarget/label；
+        // forceInput=true 的补点轮直接点原生 input，专治第一轮 clickTarget 点击没被组件接住的情况。
         const label = input.id ? document.querySelector(`label[for="${cssEscape(input.id)}"]`) : input.closest('label');
-        const target = clickTarget || label || input;
-        target.click();
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
+        const target = forceInput ? input : (clickTarget || label || input);
+        try { target.click(); } catch (e) {}
+        // 仅当直接点了原生 input 时才补发 input/change：点可视 clickTarget(普通 div)/label 时，
+        // 此刻 input.checked 往往还是旧值(false)，强行 dispatch(change) 会带着 false 把刚被组件点亮的 Vue model 复位。
+        // 点 label 会原生转发到 input 自行触发事件；点 div 由框架自身 @click 处理，都无需我们补发。
+        if (target === input) {
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
     }
 
     function trySubmitAnswer() {
@@ -887,8 +943,13 @@
                         </label>
                         <div style="display: flex; align-items: center;">
                             <span>倍速:</span>
-                            <input type="number" id="num-speed" value="${CONFIG.playbackSpeed}" step="0.5" min="0.5" max="4.0" style="width: 45px; margin-left: 4px; padding: 1px 3px; border: 1px solid #dcdfe6; border-radius: 4px; text-align: center;"> 
+                            <input type="number" id="num-speed" value="${CONFIG.playbackSpeed}" step="0.5" min="0.5" max="4.0" style="width: 45px; margin-left: 4px; padding: 1px 3px; border: 1px solid #dcdfe6; border-radius: 4px; text-align: center;">
                         </div>
+                    </div>
+                    <div style="margin-top: 6px;">
+                        <label style="cursor: pointer; display: flex; align-items: center;">
+                            <input type="checkbox" id="chk-courseware" ${CONFIG.autoCourseware ? 'checked' : ''} style="margin: 0 4px 0 0; cursor: pointer;"> 自动刷课件<span style="color:#909399; margin-left:4px;">(PPT 翻到末页再进下一节)</span>
+                        </label>
                     </div>
                     <div style="margin-top: 10px; padding-top: 8px; border-top: 1px solid #ebeef5;">
                         <div style="font-weight: bold; color: #606266; margin-bottom: 6px;">AI 做题</div>
@@ -928,6 +989,7 @@
             document.body.appendChild(panelElement);
 
             panelElement.querySelector('#chk-auto').addEventListener('change', (e) => { CONFIG.autoNext = e.target.checked; broadcastConfig(); });
+            panelElement.querySelector('#chk-courseware').addEventListener('change', (e) => { CONFIG.autoCourseware = e.target.checked; broadcastConfig(); });
             panelElement.querySelector('#num-speed').addEventListener('input', (e) => {
                 let val = parseFloat(e.target.value);
                 if (!isNaN(val)) { CONFIG.playbackSpeed = val; broadcastConfig(); }
@@ -1075,6 +1137,13 @@
         // 全局敏感黑名单特征词
         const BLACKLIST_KEYWORDS = ['课件', '测验', '考试', '作业', '练习', '文档', '资料'];
 
+        // 课件翻页状态：coursewareFlipping 防重入（一次只翻一遍），coursewareFlipDone 翻到末页后置 true 放行逃逸推进。
+        // lastCoursewareTitle 记录上一次处理的课件标题：目录树与 PPT 内容可能不在同一 iframe（各 frame 变量独立），
+        // 且 SPA 切课不重载 iframe，仅靠 doJumpV21 重置不可靠，故以「激活节点标题变化」为准重置翻页状态，跨节点/跨 frame 都稳。
+        let coursewareFlipping = false;
+        let coursewareFlipDone = false;
+        let lastCoursewareTitle = '';
+
         window.addEventListener('message', (event) => {
             const msg = event.data;
             if (!msg || typeof msg !== 'object') return;
@@ -1082,6 +1151,8 @@
             if (msg.type === 'HW_CONFIG_SYNC') {
                 CONFIG.autoNext = msg.data.autoNext;
                 CONFIG.playbackSpeed = msg.data.playbackSpeed;
+                if (typeof msg.data.autoCourseware === 'boolean') CONFIG.autoCourseware = msg.data.autoCourseware;
+                if (typeof msg.data.coursewarePageDelay === 'number') CONFIG.coursewarePageDelay = msg.data.coursewarePageDelay;
             }
 
             if (msg.type === 'HW_COMMAND_JUMP') {
@@ -1130,7 +1201,19 @@
                 // 如果当前页面激活了非视频节点且页面中找不到 video 标签，强行伪装已结束状态触发弹飞
                 if (!video) {
                     const isTargetBlack = BLACKLIST_KEYWORDS.some(kw => nodeTitle.includes(kw));
-                    if (isTargetBlack && !shouldHoldForQuiz()) {
+                    // 课件分流：开启「自动刷课件」且当前节点是课件/阅读类（命中 COURSEWARE_KEYWORDS），
+                    // 不直接逃逸，先把 PPT 逐页翻到末页（runCoursewareFlip），翻完才允许伪装 ended 推进。
+                    // 注意：测验/考试/作业/练习不在 COURSEWARE_KEYWORDS，仍走下方原有逃逸逻辑。
+                    const isCourseware = CONFIG.autoCourseware && COURSEWARE_KEYWORDS.some(kw => nodeTitle.includes(kw));
+                    // 切到新的课件节点（标题变化）即重置翻页状态，确保每个课件都从头翻、跨 frame 也生效
+                    if (isCourseware && nodeTitle !== lastCoursewareTitle) {
+                        lastCoursewareTitle = nodeTitle;
+                        coursewareFlipping = false;
+                        coursewareFlipDone = false;
+                    }
+                    if (isCourseware && !coursewareFlipDone) {
+                        runCoursewareFlip(); // 内部有防重入锁，未翻完时不允许逃逸
+                    } else if (isTargetBlack && !shouldHoldForQuiz()) {
                         packet.hasVideo = true;
                         packet.ended = true;
                         packet.isEscape = true;
@@ -1177,11 +1260,20 @@
 
                 // 【防御机制一：前置特征拦截】
                 // 检查下一行文本是否命中非视频黑名单，若命中则直接跳过此节点继续向下检索
-                const hitBlacklist = BLACKLIST_KEYWORDS.some(kw => rowText.includes(kw));
+                // 例外：开启「自动刷课件」时，课件/阅读类节点（命中 COURSEWARE_KEYWORDS）不跳过，
+                // 让导航能落到课件上由 scanner 触发逐页翻页；测验/考试/作业/练习等其余黑名单仍照常跳过。
+                const isCoursewareRow = CONFIG.autoCourseware && COURSEWARE_KEYWORDS.some(kw => rowText.includes(kw));
+                const hitBlacklist = !isCoursewareRow && BLACKLIST_KEYWORDS.some(kw => rowText.includes(kw));
                 if (hitBlacklist) {
                     console.log(`[助手 v2.1] 发现非视频盲区 [${rowText.split('\n')[0]}]，已自动执行跃迁避让。`);
                     targetIndex++;
                     continue;
+                }
+                if (isCoursewareRow) {
+                    console.log(`[助手 v2.1] 命中课件节点 [${rowText.split('\n')[0]}]，自动刷课件已开启，切入并逐页翻阅。`);
+                    coursewareFlipDone = false; // 进入新课件，重置翻页完成标记
+                    clickTreeRow(nextRow, false);
+                    return;
                 }
 
                 const nodeStatus = getRowVueOrDomStatus(nextRow);
@@ -1241,6 +1333,96 @@
                 let btn = document.querySelector(s);
                 if (btn && btn.offsetParent) { btn.click(); break; }
             }
+        }
+
+        // 【自动刷课件：启发式逐页翻页例程】
+        // 仅在 autoCourseware 开启、且当前激活节点为课件/阅读类时由 scanner 调用。
+        // 逐页点击「下一页」直至触底（按钮禁用 或 当前页>=总页），间隔 CONFIG.coursewarePageDelay，
+        // 用 setTimeout 递进不阻塞主线程；触底后置 coursewareFlipDone=true，交还 scanner 当 ended 推进。
+        function runCoursewareFlip() {
+            if (coursewareFlipping || coursewareFlipDone) return; // 防重入：同一课件只翻一遍
+            coursewareFlipping = true;
+
+            const startedAt = Date.now();
+            const MAX_PAGES = 200;          // 安全上限：最多翻 200 页
+            const MAX_TOTAL_MS = 5 * 60 * 1000; // 总超时：5 分钟兜底，避免死循环
+            let flipped = 0;
+
+            // 探测「下一页」翻页控件（启发式）：文本含「下一页/下一张/下页」或 class 含 next/right/arrow 的可点元素，
+            // 排除已禁用的（disabled / aria-disabled / class 含 disabled），禁用即视为已到末页。
+            function findNextPageBtn() {
+                const candidates = Array.from(document.querySelectorAll(
+                    'button, a, [role="button"], [class*="next" i], [class*="right" i], [class*="arrow" i]'
+                ));
+                const TEXT_KW = ['下一页', '下一张', '下页', '后一页'];
+                for (const el of candidates) {
+                    if (!el.offsetParent) continue; // 不可见跳过
+                    const disabled = el.disabled === true
+                        || el.getAttribute('disabled') !== null
+                        || el.getAttribute('aria-disabled') === 'true'
+                        || /disabled/i.test(el.className || '');
+                    const text = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+                    const cls = (el.className && el.className.toString ? el.className.toString() : '') || '';
+                    const byText = TEXT_KW.some(kw => text.includes(kw));
+                    const byClass = /next|right|arrow/i.test(cls);
+                    if (!byText && !byClass) continue;
+                    // 命中翻页特征：若禁用，返回标记表示已到末页；否则返回可点按钮
+                    if (disabled) return { atEnd: true, el: null };
+                    return { atEnd: false, el };
+                }
+                return null; // 没找到任何翻页控件
+            }
+
+            // 探测页码：匹配「3/10」「3 / 10」之类文本，判断 当前页>=总页 即末页。
+            function isLastPageByNumber() {
+                const text = (document.body.innerText || '');
+                const m = text.match(/(\d+)\s*\/\s*(\d+)/);
+                if (m) {
+                    const cur = parseInt(m[1], 10);
+                    const total = parseInt(m[2], 10);
+                    if (total > 0 && cur >= total) return true;
+                }
+                // pagination 当前页/总页：找 active 当前页与最后一个页码对比
+                const pager = document.querySelector('[class*="pagination" i], [class*="pager" i]');
+                if (pager) {
+                    const active = pager.querySelector('.active, .is-active, [class*="active" i], [class*="current" i]');
+                    const pages = Array.from(pager.querySelectorAll('li, a, span, button'))
+                        .map(n => parseInt((n.innerText || '').trim(), 10))
+                        .filter(n => !isNaN(n));
+                    if (active && pages.length) {
+                        const curNum = parseInt((active.innerText || '').trim(), 10);
+                        const maxNum = Math.max.apply(null, pages);
+                        if (!isNaN(curNum) && curNum >= maxNum) return true;
+                    }
+                }
+                return false;
+            }
+
+            function finish(reason) {
+                coursewareFlipping = false;
+                coursewareFlipDone = true; // 放行：下一轮 scanner 把该课件当 ended 推进
+                console.log(`[助手 v2.1] 课件翻页完成（${reason}），共翻 ${flipped} 页，交还连播推进。`);
+            }
+
+            function step() {
+                // 超时 / 超页数兜底
+                if (flipped >= MAX_PAGES || (Date.now() - startedAt) > MAX_TOTAL_MS) {
+                    finish('达到安全上限'); return;
+                }
+                // 末页判据一：页码显示当前页>=总页
+                if (isLastPageByNumber()) { finish('页码触底'); return; }
+
+                const next = findNextPageBtn();
+                // 末页判据二：找不到翻页控件 或 翻页按钮已禁用
+                if (!next || next.atEnd) { finish('已无可点的下一页'); return; }
+
+                try { next.el.click(); } catch (e) { /* 忽略单页点击异常，继续下一轮 */ }
+                flipped++;
+                setTimeout(step, CONFIG.coursewarePageDelay); // 按配置间隔翻下一页，给平台记录浏览时长
+            }
+
+            // 首轮延迟一拍再开始，等课件 PPT 容器渲染完成
+            setTimeout(step, CONFIG.coursewarePageDelay);
         }
 
         function formatTime(secs) {

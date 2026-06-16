@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/github/license/CaptSteven/Huwei_Helper_Plug)](LICENSE)
 [![UserScript](https://img.shields.io/badge/UserScript-Tampermonkey-orange.svg)](https://www.tampermonkey.net/)
-[![Version](https://img.shields.io/badge/version-1.3.1-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.3.9-blue.svg)]()
 
 Huwei_Helper_Plug 是一个用于华为人才在线课程页面的 Tampermonkey 脚本插件。它在课程页面注入一个悬浮控制面板，支持视频连播、倍速控制、防挂机弹窗处理，并新增 AI 做题能力。
 
@@ -12,6 +12,7 @@ Huwei_Helper_Plug 是一个用于华为人才在线课程页面的 Tampermonkey 
 - 调整视频播放倍速。
 - 自动处理常见的继续观看、确定、确认类弹窗。
 - 跳过或避开课件、测验、考试、作业等非视频节点。
+- 可选「自动刷课件」：开启后对课件 / 阅读类 PPT 节点逐页翻到末页再进入下一节（默认关闭，关闭时不影响原有连播）。
 - 支持 AI 做题：识别页面中的单选题、多选题，调用模型 API 分析答案并回填选项。
 - 支持手动做题和自动识别做题。
 - 支持全自动答题流程：自动进入测验 → 逐题作答 → 检查未作答题目 → 自动交卷 → 进入下一环节（需开启「自动提交」，默认关闭）。
