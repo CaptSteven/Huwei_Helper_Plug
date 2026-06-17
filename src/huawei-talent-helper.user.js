@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.10
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.11
 // @namespace    http://tampermonkey.net/
-// @version      1.3.10
+// @version      1.3.11
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -731,20 +731,29 @@
             const startBtn = findQuizStartButton();
             if (startBtn) {
                 startBtn.click();
+                // 标记一次「刚发生导航」：进入测验后首题 DOM 往往要等若干毫秒才渲染，
+                // 这期间 collectQuestionGroups 取不到题，下面 4s 空窗保护可避免 finalizeQuiz 误把首题跳过。
+                lastTrySubmitTime = Date.now();
                 reportAiStatus('已自动进入测验', 'info');
                 return;
             }
         }
 
         if (document.querySelector('.test-content')) {
-            // 安全门：有活跃题目时「下一题/提交」点击后 4s 内禁止调用 finalizeQuiz，
-            // 避免新题目 DOM 未渲染完成时 findQuizNextButton 误点下一题造成跳题。
-            // 无活跃题目（答题卡阶段）跳过延迟，直接进入收尾。
-            const hasActiveQuestion = !!document.querySelector('.test-content .option-list-item');
-            if (hasActiveQuestion && Date.now() - lastTrySubmitTime < 4000) {
-                reportAiStatus('等待题目加载...', 'info');
+            // 关键防跳题：只要页面上还有可作答选项（题目在屏），就绝不调用 finalizeQuiz 去点「下一题」。
+            // 走到这里说明 collectQuestionGroups 此刻没取到题，但选项还在 = 题目正在渲染或本轮解析失败，
+            // 应等下一轮重新识别作答，而不是把这道还没作答的题直接点掉（这正是「题目被自动跳过」的根因）。
+            if (document.querySelector('.test-content .option-list-item')) {
+                reportAiStatus('题目加载中，等待识别作答...', 'info');
                 return;
             }
+            // 没有可作答选项了，但刚点过「下一题/提交」：仍处于题目间过渡空窗，给下一题渲染留时间，
+            // 否则会在空窗里点到下一题按钮，把紧随其后渲染出来的题跳过。
+            if (Date.now() - lastTrySubmitTime < 4000) {
+                reportAiStatus('等待下一题加载...', 'info');
+                return;
+            }
+            // 确实没有可作答选项（答题卡 / 末尾收尾阶段）才进入收尾：检查未答 → 交卷 → 进入下一环节。
             finalizeQuiz();
             return;
         }
@@ -922,7 +931,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.10</span>
+                    <span id="hw-panel-title">华为助手 v1.3.11</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -1012,7 +1021,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.10';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.11';
                 }
                 updatePanelUI();
             });
