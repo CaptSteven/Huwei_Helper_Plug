@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.11
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.12
 // @namespace    http://tampermonkey.net/
-// @version      1.3.11
+// @version      1.3.12
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -86,6 +86,8 @@
     let lastAiSolveTime = 0;
     let quizSubmittedAt = 0;
     let lastTrySubmitTime = 0; // 记录最近一次点击「下一题/提交」的时间，用于防止转场期 finalizeQuiz 误触发跳题
+    let lastSolvedSignature = ''; // 已「确认作答成功（applied>0 校验通过）」的题目签名：只有它才允许推进
+    let lastAdvancedSignature = ''; // 已经点过「下一题」推进的题目签名：保证每题最多推进一次，杜绝盲推进/双推进跳题
 
     function loadAiConfig() {
         let saved = null;
@@ -183,8 +185,10 @@
             const answer = await askAiForAnswers(questions);
             const applied = await applyAiAnswers(questions, answer);
             if (applied > 0) {
+                // 标记本题「已确认作答成功」。推进改由 runAutoAiCycle 在确认作答后统一执行（每题只推一次），
+                // 不再在此处用盲目的 setTimeout 推进——那会与 5s 主循环 / finalizeQuiz 错位造成跳题。
+                lastSolvedSignature = signature;
                 reportAiStatus(`已回填 ${applied} 道题的答案`, 'success');
-                if (AI_CONFIG.autoSubmit) setTimeout(trySubmitAnswer, 1500);
             } else {
                 reportAiStatus('模型返回了结果，但没有匹配到可回填答案', 'warn');
             }
@@ -602,6 +606,9 @@
             .find(el => /交卷|提交|完成/.test(normalizeText(el.innerText)));
         if (sxzSubmitBtn) {
             sxzSubmitBtn.click();
+            // 登记交卷时间：交卷确认弹窗由 handlePopups 点「确定」，随后成绩页靠 quizSubmittedAt 触发
+            // tryProceedToNextStage 进入下一讲，并在 90s 内抑制「开始测验」防止重进测验死循环。
+            quizSubmittedAt = Date.now();
             reportAiStatus('已尝试自动交卷/提交', 'success');
             return;
         }
@@ -646,7 +653,16 @@
 
     // 进入下一个学习环节（答题结束后的结果页）。
     function tryProceedToNextStage() {
-        const btn = findQuizButtonByText(['下一节', '下一个', '下一章', '下一环节', '继续学习', '下一步', '继续']);
+        // 优先点 sxz 学习页底部真实的「下一讲」控件（经真机确认：.switch-btn 内 .next，文案为「下一讲」）。
+        // 这是测验交卷后进入下一节最可靠的入口；之前只找「下一节/下一章」等文案，命中不了「下一讲」，
+        // 导致交卷后停在成绩页无法前进、90s 后又自动重进测验造成「反复重测」死循环。
+        const switchNext = document.querySelector('.switch-btn .next, .outer_footer .next');
+        if (switchNext && isVisibleElement(switchNext) && !/disabled|disable/i.test(switchNext.className || '')) {
+            switchNext.click();
+            reportAiStatus('正在进入下一讲', 'info');
+            return true;
+        }
+        const btn = findQuizButtonByText(['下一讲', '下一节', '下一个', '下一章', '下一环节', '继续学习', '下一步', '继续']);
         if (btn) {
             btn.click();
             reportAiStatus('正在进入下一环节', 'info');
@@ -719,7 +735,17 @@
 
         const questions = collectQuestionGroups();
         if (questions.length > 0) {
-            await solveQuestionsWithAi('auto'); // 回填答案，开启自动提交时顺带推进到下一题
+            const sig = buildQuestionSignature(questions);
+            // 本题尚未确认作答成功 → 先作答（回填+校验），本轮不推进。
+            if (sig !== lastSolvedSignature) {
+                await solveQuestionsWithAi('auto');
+            }
+            // 仅当本题确已作答成功(lastSolvedSignature 命中)、且从未推进过 → 推进一次。
+            // 「确认作答后才推进 + 每题仅推一次」是防跳题的核心：彻底杜绝还没作答就点下一题、或同一题被推进两次。
+            if (AI_CONFIG.autoSubmit && lastSolvedSignature === sig && lastAdvancedSignature !== sig) {
+                lastAdvancedSignature = sig;
+                trySubmitAnswer();
+            }
             return;
         }
 
@@ -768,7 +794,12 @@
         }
 
         if (quizSubmittedAt && Date.now() - quizSubmittedAt < 120000) {
-            if (tryProceedToNextStage()) quizSubmittedAt = 0;
+            if (tryProceedToNextStage()) {
+                quizSubmittedAt = 0;
+                // 已进入下一讲，清空本测验的作答/推进签名，避免残留影响下一处测验的判定
+                lastSolvedSignature = '';
+                lastAdvancedSignature = '';
+            }
         }
     }
 
@@ -931,7 +962,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.11</span>
+                    <span id="hw-panel-title">华为助手 v1.3.12</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -1021,7 +1052,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.11';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.12';
                 }
                 updatePanelUI();
             });
