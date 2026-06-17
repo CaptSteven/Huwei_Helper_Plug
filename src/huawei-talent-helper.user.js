@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.13
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.14
 // @namespace    http://tampermonkey.net/
-// @version      1.3.13
+// @version      1.3.14
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -494,6 +494,15 @@
     // 会延迟到响应式 tick 之后才更新，因此除了读 input.checked，还兜底检查选项容器的选中态 class /
     // aria-checked，避免「明明点中了却被判定回填失败」。
     function isChoiceSelected(option) {
+        // 只认与「测验真实入库」一致的强信号：原生 input.checked / aria-checked=true。
+        // 【为何不再认 class】曾经还认 is-checked/is-selected/is-active/checked/chosen 等 class，
+        // 但刚「下一题」推进出来的新题，其选项常自带这类残留/默认 class（焦点/涟漪/默认高亮），
+        // 在 input.checked 仍为 false 时被误判「已选中」，于是：
+        //   ① selectQuestionOptions 以为已选 → 跳过点击（根本没点）；
+        //   ② 校验又以为已答（applied>0）→ 点「下一题」推进；
+        // 结果该题一个选项都没真正选中、测验也没记录，就被跳过——这正是第2/4题「自动跳过」的根因
+        // （2026-06 真机复现确认）。改为严格判定后：新题选项 input.checked=false → 会真正点击、
+        // 校验也只在确实选中后才推进。
         const input = option && option.input;
         if (input && input.checked) return true;
         const nodes = [
@@ -501,13 +510,7 @@
             option && option.clickTarget,
             input && input.closest('.option-list-item, .el-radio, .el-checkbox')
         ];
-        return nodes.some(node => {
-            if (!node) return false;
-            if (node.getAttribute && node.getAttribute('aria-checked') === 'true') return true;
-            // 只认明确的「选中态」class，不收裸 active/selected：后者常被 hover/focus/ripple 常驻，
-            // 在 input.checked 仍为 false 时会误判「已选中」，导致单选跳过点击却判成功、多选误点错项。
-            return /(^|[\s_-])(is-checked|is-selected|is-active|checked|chosen)([\s_-]|$)/i.test(node.className || '');
-        });
+        return nodes.some(node => node && node.getAttribute && node.getAttribute('aria-checked') === 'true');
     }
 
     // 对单道题执行一次点选（按目标索引选中、并取消多选题里多余的勾选）。
@@ -979,7 +982,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.13</span>
+                    <span id="hw-panel-title">华为助手 v1.3.14</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -1069,7 +1072,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.13';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.14';
                 }
                 updatePanelUI();
             });
