@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.14
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.15
 // @namespace    http://tampermonkey.net/
-// @version      1.3.14
+// @version      1.3.15
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -695,6 +695,26 @@
         return items.find(it => /un-?answer|no-?answer|undone|not-?done|wait|empty|gray|grey/i.test(it.className || '')) || null;
     }
 
+    // 找到「重新测验 / 再次测验」入口：出现它即代表这套题之前已做过（成绩/结果页特有）。
+    function findQuizRetakeButton() {
+        return findQuizButtonByText(['重新测验', '再次测验', '重新答题', '重新考试', '再考一次', '再次作答', '重新作答', '重做']);
+    }
+
+    // 判定：当前测验是否「已经完成」（成绩/结果页），用于落到已完成测验节点时直接跳过、避免重复调用 AI 浪费额度。
+    // 严格用「屏上无可作答题目 + 无交卷按钮」两道闸门防误判，再要求出现「重做入口」或「成绩文案」其一作为正向证据。
+    function isQuizAlreadyCompleted() {
+        if (!AI_CONFIG.enabled || !AI_CONFIG.autoSolve) return false;
+        // 屏上还有可作答选项 / 仍有交卷按钮 = 正在答题，绝不当作已完成
+        if (document.querySelector('.test-content .option-list-item')) return false;
+        if (findQuizSubmitButton()) return false;
+        // 正向证据一：出现「重新测验」类入口（仅做过的题才会有）
+        if (findQuizRetakeButton()) return true;
+        // 正向证据二：成绩/结果页文案（用具体词避免误命中「成绩计入…」等说明）
+        const scope = document.querySelector('.test-content, [class*="result" i], [class*="score" i], [class*="grade" i]') || document.body;
+        const text = normalizeText(scope.innerText || '').slice(0, 4000);
+        return /本次得分|本次成绩|您的得分|得分[:：]|正确率|答对\s*\d+\s*题|测验已完成|测验完成|考试已完成|您已完成本测验|成绩合格/.test(text);
+    }
+
     // 当前是否正处于「正在答题」的测验流程中（用于抑制盲区逃逸，避免半途跳走）。
     function shouldHoldForQuiz() {
         if (!AI_CONFIG.enabled || !AI_CONFIG.autoSolve) return false;
@@ -765,6 +785,17 @@
                 lastAdvancedSignature = sig;
                 console.log(`[华为助手 AI][cycle] 推进(下一题/交卷): ${dbgTitle}`);
                 trySubmitAnswer();
+            }
+            return;
+        }
+
+        // 测验已完成（成绩/结果页，或带「重新测验」入口）：直接进入下一节，不重复做题浪费 API。
+        // 放在 autoSubmit 闸门之前——跳过已完成节点属于「避让非作答节点」，与连播逃逸同性质，不应被自动提交开关挡住。
+        if (isQuizAlreadyCompleted()) {
+            reportAiStatus('检测到本测验已完成，直接进入下一节', 'success');
+            if (tryProceedToNextStage()) {
+                lastSolvedSignature = '';
+                lastAdvancedSignature = '';
             }
             return;
         }
@@ -982,7 +1013,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.14</span>
+                    <span id="hw-panel-title">华为助手 v1.3.15</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -1072,7 +1103,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.14';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.15';
                 }
                 updatePanelUI();
             });
